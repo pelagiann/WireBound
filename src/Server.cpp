@@ -1,246 +1,206 @@
 #include <iostream>
 #include <WinSock2.h>
 #include <WS2tcpip.h>
-#include <fstream>
-#include <filesystem>
-#include <vector>
+#include <windows.h>
 #include <chrono>
+#include <cstring>
 
 #include "protocol.h"
 #include "chunk_source.hpp"
+#include "mapped_chunk_source.hpp"
+#include "progress_tracker.hpp"
 
 #pragma comment(lib, "Ws2_32.lib")
 
 using namespace std;
 using namespace maxxcast;
 
-bool sendAll(SOCKET socket, const char* data, int totalBytes)
+// sendAll — loop until every byte is written to the socket.
+bool sendAll(SOCKET sock, const void* data, int len)
 {
-    int sentBytes = 0;
-
-    while (sentBytes < totalBytes)
+    const char* ptr = static_cast<const char*>(data);
+    int sent = 0;
+    while (sent < len)
     {
-        int sent = send(socket,
-                        data + sentBytes,
-                        totalBytes - sentBytes,
-                        0);
-
-        if (sent <= 0)
-        {
-            return false;
-        }
-
-        sentBytes += sent;
+        int n = send(sock, ptr + sent, len - sent, 0);
+        if (n <= 0) return false;
+        sent += n;
     }
-
     return true;
 }
 
-uint64_t get_file_size(const string& path)
+// serve_client: send the full file to one connected client.
+bool serve_client(SOCKET sock, const MappedChunkSource& src, ClientProgress& progress)
 {
-    ifstream file(path, ios::binary | ios::ate);
-    return static_cast<uint64_t>(file.tellg());
+    const FileMeta& meta = src.metadata();
+
+    BOOL nodelay = TRUE;
+    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, (char*)&nodelay, sizeof(nodelay));
+    int sndbuf = 4 * 1024 * 1024;   // 4 MB send buffer
+    setsockopt(sock, SOL_SOCKET, SO_SNDBUF, (char*)&sndbuf, sizeof(sndbuf));
+
+    FileMetaWire wire{};
+    wire.total_size  = meta.total_size;
+    wire.chunk_size  = meta.chunk_size;
+    wire.chunk_count = meta.chunk_count;
+    memcpy(wire.sha256_hex, meta.sha256_hex.c_str(), 64);
+
+    if (!sendAll(sock, &wire, sizeof(wire)))
+    {
+        cerr << "\n[Client " << progress.id << "] Failed to send metadata\n";
+        progress.failed = true;
+        return false;
+    }
+
+    uint32_t fnLen = static_cast<uint32_t>(meta.filename.size());
+    if (!sendAll(sock, &fnLen, sizeof(fnLen)) ||
+        !sendAll(sock, meta.filename.c_str(), static_cast<int>(fnLen)))
+    {
+        cerr << "\n[Client " << progress.id << "] Failed to send filename\n";
+        progress.failed = true;
+        return false;
+    }
+
+    for (uint64_t i = 0; i < src.chunk_count(); ++i)
+    {
+        ChunkView chunk = src.get_chunk(i);
+
+        ChunkHeader hdr{};
+        hdr.index = chunk.index;
+        hdr.size  = static_cast<uint32_t>(chunk.len);
+
+        if (!sendAll(sock, &hdr, sizeof(hdr)) ||
+            !sendAll(sock, chunk.data, static_cast<int>(chunk.len)))
+        {
+            cerr << "\n[Client " << progress.id
+                 << "] Transfer failed at chunk " << i << "\n";
+            progress.failed = true;
+            return false;
+        }
+
+        progress.chunks_sent++;
+        progress.bytes_sent += chunk.len;
+        progress.print_inline();
+    }
+
+    progress.complete = true;
+    return true;
 }
 
-int main()
+int main(int argc, char* argv[])
 {
-    const int PORT = 6767;
-    const uint32_t CHUNK_SIZE = 256*1024;
+    if (argc < 2)
+    {
+        cerr << "Usage: Server.exe <file-to-send>\n";
+        return 1;
+    }
 
-    string filePath = "C:/Users/Ishan/Desktop/Test.pdf";
+    const int      PORT       = 6767;
+    const uint32_t CHUNK_SIZE = 256 * 1024;
 
-    uint64_t fileSize = get_file_size(filePath);
+    MappedChunkSource src(argv[1], CHUNK_SIZE);
+    const FileMeta& meta = src.metadata();
 
-    uint64_t chunkCount =
-        (fileSize + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    cout << "=== MaxxCast Server ===\n";
+    cout << "File      : " << meta.filename   << "\n";
+    cout << "Size      : " << meta.total_size << " bytes\n";
+    cout << "Chunks    : " << meta.chunk_count
+         << " x " << meta.chunk_size << " bytes\n";
+    cout << "SHA-256   : " << meta.sha256_hex << "\n\n";
 
-    FileMeta meta;
-    meta.filename = filesystem::path(filePath).filename().string();
-    meta.total_size = fileSize;
-    meta.chunk_size = CHUNK_SIZE;
-    meta.chunk_count = chunkCount;
+    IO_COUNTERS io_before{};
+    GetProcessIoCounters(GetCurrentProcess(), &io_before);
 
     WSADATA wsaData;
-
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
     {
-        cout << "WSAStartup failed\n";
+        cerr << "WSAStartup failed\n";
         return 1;
     }
 
-    SOCKET serverSocket =
-        socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-
+    SOCKET serverSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (serverSocket == INVALID_SOCKET)
     {
-        cout << "Socket creation failed\n";
+        cerr << "Socket creation failed\n";
         WSACleanup();
         return 1;
     }
 
-    sockaddr_in serverAddr{};
+    /* SO_REUSEADDR: lets us restart the server immediately without waiting
+    for the OS to release the port from the previous run*/
+    BOOL reuse = TRUE;
+    setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, (char*)&reuse, sizeof(reuse));
 
-    serverAddr.sin_family = AF_INET;
-    serverAddr.sin_port = htons(PORT);
+    sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_port        = htons(PORT);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY); 
 
-    InetPton(AF_INET,
-             TEXT("127.0.0.1"),
-             &serverAddr.sin_addr.s_addr);
-
-    if (bind(serverSocket,
-             (sockaddr*)&serverAddr,
-             sizeof(serverAddr)) == SOCKET_ERROR)
+    if (bind(serverSocket, (sockaddr*)&addr, sizeof(addr)) == SOCKET_ERROR)
     {
-        cout << "Bind failed\n";
-
+        cerr << "Bind failed (error " << WSAGetLastError() << ")\n";
         closesocket(serverSocket);
         WSACleanup();
-
         return 1;
     }
 
     if (listen(serverSocket, 1) == SOCKET_ERROR)
     {
-        cout << "Listen failed\n";
-
+        cerr << "Listen failed\n";
         closesocket(serverSocket);
         WSACleanup();
-
         return 1;
     }
 
-    cout << "Listening on port "
-         << PORT
-         << endl;
+    cout << "Listening on port " << PORT << " (all interfaces)...\n";
 
-    SOCKET clientSocket =
-        accept(serverSocket, nullptr, nullptr);
-
+    SOCKET clientSocket = accept(serverSocket, nullptr, nullptr);
     if (clientSocket == INVALID_SOCKET)
     {
-        cout << "Accept failed\n";
-
+        cerr << "Accept failed\n";
         closesocket(serverSocket);
         WSACleanup();
-
         return 1;
     }
 
-    cout << "Client connected\n";
-    
-    BOOL flag = TRUE;
+    cout << "Client connected. Starting transfer...\n\n";
 
-	setsockopt(clientSocket,
-           IPPROTO_TCP,
-           TCP_NODELAY,
-           (char*)&flag,
-           sizeof(flag));
-    int sndbuf = 1024 * 1024;
+    ClientProgress progress;
+    progress.id           = 1;
+    progress.total_chunks = meta.chunk_count;
+    progress.total_bytes  = meta.total_size;
 
-	setsockopt(clientSocket,
-           SOL_SOCKET,
-           SO_SNDBUF,
-           (char*)&sndbuf,
-           sizeof(sndbuf));
-    FileMetaWire wireMeta;
-    wireMeta.total_size = meta.total_size;
-    wireMeta.chunk_size = meta.chunk_size;
-    wireMeta.chunk_count = meta.chunk_count;
+    auto t_start = chrono::high_resolution_clock::now();
 
-    if (!sendAll(clientSocket,
-                 (char*)&wireMeta,
-                 sizeof(wireMeta)))
-    {
-        cout << "Failed to send metadata\n";
-        return 1;
-    }
+    bool ok = serve_client(clientSocket, src, progress);
 
-    uint32_t filenameLen =
-        static_cast<uint32_t>(meta.filename.size());
+    auto t_end = chrono::high_resolution_clock::now();
 
-    if (!sendAll(clientSocket,
-                 (char*)&filenameLen,
-                 sizeof(filenameLen)))
-    {
-        cout << "Failed to send filename length\n";
-        return 1;
-    }
 
-    if (!sendAll(clientSocket,
-                 meta.filename.c_str(),
-                 filenameLen))
-    {
-        cout << "Failed to send filename\n";
-        return 1;
-    }
+    IO_COUNTERS io_after{};
+    GetProcessIoCounters(GetCurrentProcess(), &io_after);
 
-    ifstream file(filePath, ios::binary);
+    uint64_t disk_reads = io_after.ReadOperationCount - io_before.ReadOperationCount;
+    uint64_t disk_bytes = io_after.ReadTransferCount  - io_before.ReadTransferCount;
 
-    vector<char> buffer(CHUNK_SIZE);
 
-    uint64_t chunkIndex = 0;
-    
-    auto start = chrono::high_resolution_clock::now();
+    double seconds = chrono::duration<double>(t_end - t_start).count();
+    double mbps    = (meta.total_size / (1024.0 * 1024.0)) / seconds;
 
-    while (true)
-    {
-        file.read(buffer.data(), buffer.size());
-
-        streamsize bytesRead = file.gcount();
-
-        if (bytesRead <= 0)
-        {
-            break;
-        }
-
-        ChunkHeader header;
-        header.index = chunkIndex++;
-        header.size = static_cast<uint32_t>(bytesRead);
-
-        bool headerOk =
-            sendAll(clientSocket,
-                    (char*)&header,
-                    sizeof(header));
-
-        bool chunkOk =
-            sendAll(clientSocket,
-                    buffer.data(),
-                    static_cast<int>(bytesRead));
-
-        if (!headerOk || !chunkOk)
-        {
-            cout << "Transfer failed\n";
-            break;
-        }
-
-        cout << "Sent chunk "
-             << header.index
-             << " ("
-             << header.size
-             << " bytes)\n";
-    }
-
-    cout << "Transfer complete\n";
-
-    file.close();
-    
-    auto end =
-    chrono::high_resolution_clock::now();
-
-	double seconds =
-    chrono::duration<double>(end - start).count();
-
-	double mbps =
-    (fileSize / (1024.0 * 1024.0)) / seconds;
-
-	cout << "\nTransfer speed: "
-     << mbps
-     << " MB/s\n";
+    cout << "\n\n=== Transfer Complete ===\n";
+    cout << "Status     : " << (ok ? "OK" : "FAILED") << "\n";
+    cout << "Time       : " << seconds << " s\n";
+    cout << "Throughput : " << mbps    << " MB/s\n";
+    cout << "Disk reads : " << disk_reads << " ops ("
+         << disk_bytes << " bytes)\n";
+    if (disk_reads == 0)
+        cout << "             ^ GOOD: entire transfer served from page cache\n";
+    else
+        cout << "             ^ NOTE: some disk reads occurred\n";
 
     closesocket(clientSocket);
     closesocket(serverSocket);
-
     WSACleanup();
 
-    return 0;
+    return ok ? 0 : 1;
 }
