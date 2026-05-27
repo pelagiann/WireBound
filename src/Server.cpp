@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <chrono>
 #include <cstring>
+#include <thread>
 
 #include "protocol.h"
 #include "chunk_source.hpp"
@@ -66,6 +67,7 @@ bool serve_client(SOCKET sock, const MappedChunkSource& src, ClientProgress& pro
         ChunkView chunk = src.get_chunk(i);
 
         ChunkHeader hdr{};
+        hdr.type = PACKET_CHUNK;
         hdr.index = chunk.index;
         hdr.size  = static_cast<uint32_t>(chunk.len);
 
@@ -82,6 +84,18 @@ bool serve_client(SOCKET sock, const MappedChunkSource& src, ClientProgress& pro
         progress.bytes_sent += chunk.len;
         progress.print_inline();
     }
+    
+    ChunkHeader endHdr{};
+    endHdr.type = PACKET_END;
+    
+    if (!sendAll(sock, &endHdr, sizeof(endHdr)))
+	{
+    cerr << "\n[Client " << progress.id
+         << "] Failed to send END packet\n";
+
+    progress.failed = true;
+    return false;
+	}
 
     progress.complete = true;
     return true;
@@ -144,7 +158,7 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    if (listen(serverSocket, 1) == SOCKET_ERROR)
+    if (listen(serverSocket, SOMAXCONN) == SOCKET_ERROR)
     {
         cerr << "Listen failed\n";
         closesocket(serverSocket);
@@ -154,28 +168,42 @@ int main(int argc, char* argv[])
 
     cout << "Listening on port " << PORT << " (all interfaces)...\n";
 
-    SOCKET clientSocket = accept(serverSocket, nullptr, nullptr);
-    if (clientSocket == INVALID_SOCKET)
+    int client_id = 0;
+
+    while (true)
     {
-        cerr << "Accept failed\n";
-        closesocket(serverSocket);
-        WSACleanup();
-        return 1;
+        SOCKET clientSocket = accept(serverSocket, nullptr, nullptr);
+        if (clientSocket == INVALID_SOCKET)
+        {
+            cerr << "Accept failed (error " << WSAGetLastError() << ") — stopping.\n";
+            break;
+        }
+
+        int id = ++client_id;
+        cout << "\n[Client " << id << "] connected.\n";
+
+        // Each client gets its own thread; src is read-only so sharing is safe.
+        thread([clientSocket, id, &src, &meta]()
+        {
+            ClientProgress progress;
+            progress.id           = id;
+            progress.total_chunks = meta.chunk_count;
+            progress.total_bytes  = meta.total_size;
+
+            auto t0 = chrono::high_resolution_clock::now();
+            bool ok = serve_client(clientSocket, src, progress);
+            auto t1 = chrono::high_resolution_clock::now();
+
+            double sec  = chrono::duration<double>(t1 - t0).count();
+            double mbps = (meta.total_size / (1024.0 * 1024.0)) / sec;
+
+            cout << "\n[Client " << id << "] "
+                 << (ok ? "done" : "FAILED")
+                 << " — " << mbps << " MB/s\n";
+
+            closesocket(clientSocket);
+        }).detach();
     }
-
-    cout << "Client connected. Starting transfer...\n\n";
-
-    ClientProgress progress;
-    progress.id           = 1;
-    progress.total_chunks = meta.chunk_count;
-    progress.total_bytes  = meta.total_size;
-
-    auto t_start = chrono::high_resolution_clock::now();
-
-    bool ok = serve_client(clientSocket, src, progress);
-
-    auto t_end = chrono::high_resolution_clock::now();
-
 
     IO_COUNTERS io_after{};
     GetProcessIoCounters(GetCurrentProcess(), &io_after);
@@ -183,24 +211,13 @@ int main(int argc, char* argv[])
     uint64_t disk_reads = io_after.ReadOperationCount - io_before.ReadOperationCount;
     uint64_t disk_bytes = io_after.ReadTransferCount  - io_before.ReadTransferCount;
 
-
-    double seconds = chrono::duration<double>(t_end - t_start).count();
-    double mbps    = (meta.total_size / (1024.0 * 1024.0)) / seconds;
-
-    cout << "\n\n=== Transfer Complete ===\n";
-    cout << "Status     : " << (ok ? "OK" : "FAILED") << "\n";
-    cout << "Time       : " << seconds << " s\n";
-    cout << "Throughput : " << mbps    << " MB/s\n";
-    cout << "Disk reads : " << disk_reads << " ops ("
-         << disk_bytes << " bytes)\n";
+    cout << "\nDisk reads : " << disk_reads << " ops (" << disk_bytes << " bytes)\n";
     if (disk_reads == 0)
         cout << "             ^ GOOD: entire transfer served from page cache\n";
     else
         cout << "             ^ NOTE: some disk reads occurred\n";
 
-    closesocket(clientSocket);
     closesocket(serverSocket);
     WSACleanup();
-
-    return ok ? 0 : 1;
+    return 0;
 }

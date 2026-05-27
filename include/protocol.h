@@ -2,8 +2,17 @@
 
 #include <cstdint>
 
+
+enum PacketType : uint32_t
+{
+    PACKET_CHUNK = 1,
+    PACKET_END   = 2
+};
+
+
 struct ChunkHeader
 {
+    uint32_t type;
     uint64_t index;
     uint32_t size;
 };
@@ -15,3 +24,5 @@ struct FileMetaWire
     uint64_t chunk_count;
     char     sha256_hex[64];
 };
+
+

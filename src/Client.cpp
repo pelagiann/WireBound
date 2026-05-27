@@ -130,8 +130,29 @@ int main()
         ChunkHeader hdr{};
         if (!recvAll(sock, &hdr, sizeof(hdr)))
         {
-            break;
+        	cerr<<"\nConnection lost unexpectedly\n";
+        	outFile.close();
+        	closesocket(sock);
+        	WSACleanup();
+        	return 1;
+            
         }
+        if(hdr.type==PACKET_END)
+        {
+        	cout<<"\nReceived END packet\n";
+        	break;
+        }
+        if (hdr.type != PACKET_CHUNK)
+    	{
+        	cerr << "\nUnknown packet type: "
+             << hdr.type << "\n";
+
+        	outFile.close();
+        	closesocket(sock);
+        	WSACleanup();
+
+       	    return 1;
+    	}
 
         vector<char> buf(hdr.size);
         if (!recvAll(sock, buf.data(), static_cast<int>(hdr.size)))
@@ -183,10 +204,12 @@ int main()
         cout << "\nRESULT: FAIL — SHA-256 mismatch. File is corrupted.\n";
         closesocket(sock);
         WSACleanup();
+        system("pause");
         return 1;
     }
 
     closesocket(sock);
     WSACleanup();
+    system("pause");
     return 0;
 }

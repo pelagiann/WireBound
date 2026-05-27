@@ -3,6 +3,7 @@
 
 #include <stdexcept>
 #include <string>
+#include <iostream>
 
 namespace maxxcast {
 
@@ -21,7 +22,7 @@ MappedChunkSource::MappedChunkSource(const std::string& filepath,
         FILE_SHARE_READ,
         nullptr,
         OPEN_EXISTING,
-        FILE_FLAG_SEQUENTIAL_SCAN,
+        0,
         nullptr
     );
     if (hFile_ == INVALID_HANDLE_VALUE) {
@@ -72,12 +73,41 @@ MappedChunkSource::MappedChunkSource(const std::string& filepath,
             std::to_string(GetLastError()) + ")"
         );
     }
+	picosha2::hash256_one_by_one hasher;
+	hasher.init();
 
-    std::string sha256_hex = picosha2::hash256_hex_string(
-        view_,
-        view_ + fileSize.QuadPart
-    );
+	const size_t HASH_BLOCK_SIZE = 16 * 1024 * 1024; // 16 MB
 
+	uint64_t processed = 0;
+
+	while (processed < static_cast<uint64_t>(fileSize.QuadPart))
+	{
+    	size_t remaining =
+        	static_cast<size_t>(fileSize.QuadPart - processed);
+
+    	size_t block =
+        	(remaining > HASH_BLOCK_SIZE)
+        	? HASH_BLOCK_SIZE
+        	: remaining;
+
+    	hasher.process(
+       	 	view_ + processed,
+        	view_ + processed + block
+    	);
+
+    	processed += block;
+
+   		 std::cout << "\rHashing: "
+         << processed / (1024 * 1024)
+         << " MB";
+	}
+
+	hasher.finish();
+
+	std::string sha256_hex =
+    picosha2::get_hash_hex_string(hasher);
+
+	std::cout << "\nSHA-256 complete.\n";
     meta_.filename    = extract_filename(filepath);
     meta_.total_size  = static_cast<uint64_t>(fileSize.QuadPart);
     meta_.chunk_size  = chunk_size;
