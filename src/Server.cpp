@@ -4,6 +4,7 @@
 #include <windows.h>
 #include <chrono>
 #include <cstring>
+#include <mutex>
 #include <thread>
 
 #include "protocol.h"
@@ -48,7 +49,8 @@ bool serve_client(SOCKET sock, const MappedChunkSource& src, ClientProgress& pro
 
     if (!sendAll(sock, &wire, sizeof(wire)))
     {
-        cerr << "\n[Client " << progress.id << "] Failed to send metadata\n";
+        { lock_guard<mutex> lk(g_console_mtx);
+          cerr << "\n[Client " << progress.id << "] Failed to send metadata\n"; }
         progress.failed = true;
         return false;
     }
@@ -57,7 +59,8 @@ bool serve_client(SOCKET sock, const MappedChunkSource& src, ClientProgress& pro
     if (!sendAll(sock, &fnLen, sizeof(fnLen)) ||
         !sendAll(sock, meta.filename.c_str(), static_cast<int>(fnLen)))
     {
-        cerr << "\n[Client " << progress.id << "] Failed to send filename\n";
+        { lock_guard<mutex> lk(g_console_mtx);
+          cerr << "\n[Client " << progress.id << "] Failed to send filename\n"; }
         progress.failed = true;
         return false;
     }
@@ -74,8 +77,9 @@ bool serve_client(SOCKET sock, const MappedChunkSource& src, ClientProgress& pro
         if (!sendAll(sock, &hdr, sizeof(hdr)) ||
             !sendAll(sock, chunk.data, static_cast<int>(chunk.len)))
         {
-            cerr << "\n[Client " << progress.id
-                 << "] Transfer failed at chunk " << i << "\n";
+            { lock_guard<mutex> lk(g_console_mtx);
+              cerr << "\n[Client " << progress.id
+                   << "] Transfer failed at chunk " << i << "\n"; }
             progress.failed = true;
             return false;
         }
@@ -89,13 +93,12 @@ bool serve_client(SOCKET sock, const MappedChunkSource& src, ClientProgress& pro
     endHdr.type = PACKET_END;
     
     if (!sendAll(sock, &endHdr, sizeof(endHdr)))
-	{
-    cerr << "\n[Client " << progress.id
-         << "] Failed to send END packet\n";
-
-    progress.failed = true;
-    return false;
-	}
+    {
+        { lock_guard<mutex> lk(g_console_mtx);
+          cerr << "\n[Client " << progress.id << "] Failed to send END packet\n"; }
+        progress.failed = true;
+        return false;
+    }
 
     progress.complete = true;
     return true;
@@ -180,7 +183,8 @@ int main(int argc, char* argv[])
         }
 
         int id = ++client_id;
-        cout << "\n[Client " << id << "] connected.\n";
+        { lock_guard<mutex> lk(g_console_mtx);
+          cout << "\n[Client " << id << "] connected.\n"; }
 
         // Each client gets its own thread; src is read-only so sharing is safe.
         thread([clientSocket, id, &src, &meta]()
@@ -197,9 +201,10 @@ int main(int argc, char* argv[])
             double sec  = chrono::duration<double>(t1 - t0).count();
             double mbps = (meta.total_size / (1024.0 * 1024.0)) / sec;
 
-            cout << "\n[Client " << id << "] "
-                 << (ok ? "done" : "FAILED")
-                 << " — " << mbps << " MB/s\n";
+            { lock_guard<mutex> lk(g_console_mtx);
+              cout << "\n[Client " << id << "] "
+                   << (ok ? "done" : "FAILED")
+                   << "  " << mbps << " MB/s\n"; }
 
             closesocket(clientSocket);
         }).detach();

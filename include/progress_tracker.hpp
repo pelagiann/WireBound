@@ -3,8 +3,12 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <mutex>
 
 namespace maxxcast {
+
+// All threads serialize console writes through this single mutex.
+inline std::mutex g_console_mtx;
 
 // Tracks the send progress of one client connection.
 // Uses atomics so it's safe to update from a sender thread and read from a monitor/logger thread simultaneously.
@@ -29,6 +33,7 @@ struct ClientProgress
         double mb_sent  = bytes_sent.load()  / (1024.0 * 1024.0);
         double mb_total = total_bytes        / (1024.0 * 1024.0);
 
+        std::lock_guard<std::mutex> lk(g_console_mtx);
         printf("\r  [Client %d] chunk %llu/%llu  (%.1f%%)  %.2f / %.2f MB",
                id,
                (unsigned long long)chunks_sent.load(),
