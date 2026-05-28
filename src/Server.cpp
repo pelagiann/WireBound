@@ -6,6 +6,7 @@
 #include <cstring>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 #include "protocol.h"
 #include "chunk_source.hpp"
@@ -170,7 +171,7 @@ int main(int argc, char* argv[])
     }
 
     cout << "Listening on port " << PORT << " (all interfaces)...\n";
-
+	vector<thread> workers;
     int client_id = 0;
 
     while (true)
@@ -183,33 +184,40 @@ int main(int argc, char* argv[])
         }
 
         int id = ++client_id;
+        
         { lock_guard<mutex> lk(g_console_mtx);
           cout << "\n[Client " << id << "] connected.\n"; }
 
         // Each client gets its own thread; src is read-only so sharing is safe.
-        thread([clientSocket, id, &src, &meta]()
-        {
-            ClientProgress progress;
-            progress.id           = id;
-            progress.total_chunks = meta.chunk_count;
-            progress.total_bytes  = meta.total_size;
+        workers.emplace_back([clientSocket, id, &src, &meta]()
+		{
+    		ClientProgress progress;
+    		progress.id           = id;
+    		progress.total_chunks = meta.chunk_count;
+    		progress.total_bytes  = meta.total_size;
 
-            auto t0 = chrono::high_resolution_clock::now();
-            bool ok = serve_client(clientSocket, src, progress);
-            auto t1 = chrono::high_resolution_clock::now();
+   		 	auto t0 = chrono::high_resolution_clock::now();
+    	 	bool ok = serve_client(clientSocket, src, progress);
+    	 	auto t1 = chrono::high_resolution_clock::now();
 
-            double sec  = chrono::duration<double>(t1 - t0).count();
-            double mbps = (meta.total_size / (1024.0 * 1024.0)) / sec;
+    		double sec  = chrono::duration<double>(t1 - t0).count();
+    		double mbps = (meta.total_size / (1024.0 * 1024.0)) / sec;
 
-            { lock_guard<mutex> lk(g_console_mtx);
-              cout << "\n[Client " << id << "] "
-                   << (ok ? "done" : "FAILED")
-                   << "  " << mbps << " MB/s\n"; }
+    		{ lock_guard<mutex> lk(g_console_mtx);
+      			cout << "\n[Client " << id << "] "
+           		<< (ok ? "done" : "FAILED")
+           		<< "  " << mbps << " MB/s\n"; }
 
-            closesocket(clientSocket);
-        }).detach();
+    		closesocket(clientSocket);
+		});
     }
-
+	for (thread& t : workers)
+	{
+    	if (t.joinable())
+   	 	{
+        	t.join();
+    	}
+	}
     IO_COUNTERS io_after{};
     GetProcessIoCounters(GetCurrentProcess(), &io_after);
 
