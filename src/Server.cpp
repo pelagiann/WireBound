@@ -2,6 +2,7 @@
 #include <WinSock2.h>
 #include <WS2tcpip.h>
 #include <windows.h>
+#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <mutex>
@@ -105,6 +106,23 @@ bool serve_client(SOCKET sock, const MappedChunkSource& src, ClientProgress& pro
     return true;
 }
 
+// Set by the Ctrl+C handler; checked in the accept loop to suppress spurious error messages.
+atomic<bool> g_shutdown    { false };
+SOCKET       g_serverSocket = INVALID_SOCKET;
+
+BOOL WINAPI console_ctrl_handler(DWORD type)
+{
+    if (type == CTRL_C_EVENT || type == CTRL_CLOSE_EVENT)
+    {
+        g_shutdown = true;
+        { lock_guard<mutex> lk(g_console_mtx);
+          cout << "\nShutdown requested — waiting for active transfers...\n"; }
+        closesocket(g_serverSocket);  // unblocks accept()
+        return TRUE;
+    }
+    return FALSE;
+}
+
 int main(int argc, char* argv[])
 {
     if (argc < 2)
@@ -170,6 +188,9 @@ int main(int argc, char* argv[])
         return 1;
     }
 
+    SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
+    g_serverSocket = serverSocket;
+
     cout << "Listening on port " << PORT << " (all interfaces)...\n";
 	vector<thread> workers;
     int client_id = 0;
@@ -179,7 +200,9 @@ int main(int argc, char* argv[])
         SOCKET clientSocket = accept(serverSocket, nullptr, nullptr);
         if (clientSocket == INVALID_SOCKET)
         {
-            cerr << "Accept failed (error " << WSAGetLastError() << ") — stopping.\n";
+            if (!g_shutdown)
+            { lock_guard<mutex> lk(g_console_mtx);
+              cerr << "Accept failed (error " << WSAGetLastError() << ") — stopping.\n"; }
             break;
         }
 
@@ -190,26 +213,37 @@ int main(int argc, char* argv[])
 
         // Each client gets its own thread; src is read-only so sharing is safe.
         workers.emplace_back([clientSocket, id, &src, &meta]()
-		{
-    		ClientProgress progress;
-    		progress.id           = id;
-    		progress.total_chunks = meta.chunk_count;
-    		progress.total_bytes  = meta.total_size;
+        {
+            ClientProgress progress;
+            progress.id           = id;
+            progress.total_chunks = meta.chunk_count;
+            progress.total_bytes  = meta.total_size;
 
-   		 	auto t0 = chrono::high_resolution_clock::now();
-    	 	bool ok = serve_client(clientSocket, src, progress);
-    	 	auto t1 = chrono::high_resolution_clock::now();
+            auto t0 = chrono::high_resolution_clock::now();
+            bool ok = false;
+            try
+            {
+                ok = serve_client(clientSocket, src, progress);
+            }
+            catch (...)
+            {
+                lock_guard<mutex> lk(g_console_mtx);
+                cerr << "\n[Client " << id << "] unexpected exception — dropped.\n";
+            }
+            auto t1 = chrono::high_resolution_clock::now();
 
-    		double sec  = chrono::duration<double>(t1 - t0).count();
-    		double mbps = (meta.total_size / (1024.0 * 1024.0)) / sec;
+            closesocket(clientSocket);  // always runs, even if serve_client threw
 
-    		{ lock_guard<mutex> lk(g_console_mtx);
-      			cout << "\n[Client " << id << "] "
-           		<< (ok ? "done" : "FAILED")
-           		<< "  " << mbps << " MB/s\n"; }
+            double sec  = chrono::duration<double>(t1 - t0).count();
+            double mbps = (sec > 0.0)
+                          ? (meta.total_size / (1024.0 * 1024.0)) / sec
+                          : 0.0;
 
-    		closesocket(clientSocket);
-		});
+            { lock_guard<mutex> lk(g_console_mtx);
+              cout << "\n[Client " << id << "] "
+                   << (ok ? "done" : "FAILED")
+                   << "  " << mbps << " MB/s\n"; }
+        });
     }
 	for (thread& t : workers)
 	{
