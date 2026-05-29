@@ -46,6 +46,10 @@ MappedChunkSource::MappedChunkSource(const std::string& filepath,
             "MappedChunkSource: file is empty: " + filepath
         );
     }
+    if (chunk_size == 0) {
+        CloseHandle(hFile_); hFile_ = INVALID_HANDLE_VALUE;
+        throw std::invalid_argument("MappedChunkSource: chunk_size must be > 0");
+    }
 
     hMap_ = CreateFileMappingA(
         hFile_,
@@ -126,6 +130,10 @@ const FileMeta& MappedChunkSource::metadata() const {
 }
 
 ChunkView MappedChunkSource::get_chunk(uint64_t index) const {
+    if (index >= meta_.chunk_count)
+        throw std::out_of_range("MappedChunkSource::get_chunk: index " +
+                                std::to_string(index) + " >= chunk_count " +
+                                std::to_string(meta_.chunk_count));
     const uint64_t offset = index * meta_.chunk_size;
 
     const size_t len = (offset + meta_.chunk_size <= meta_.total_size)

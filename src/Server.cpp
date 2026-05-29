@@ -136,7 +136,11 @@ int main(int argc, char* argv[])
     const int PORT      = 6767;
     uint32_t  CHUNK_SIZE = 256 * 1024;
     if (argc >= 3)
-        CHUNK_SIZE = static_cast<uint32_t>(stoul(argv[2])) * 1024;
+    {
+        try { CHUNK_SIZE = static_cast<uint32_t>(stoul(argv[2])) * 1024; }
+        catch (...) { cerr << "Invalid chunk-size-kb: " << argv[2] << "\n"; return 1; }
+        if (CHUNK_SIZE == 0) { cerr << "chunk-size-kb must be > 0\n"; return 1; }
+    }
 
     MappedChunkSource src(argv[1], CHUNK_SIZE);
     const FileMeta& meta = src.metadata();
