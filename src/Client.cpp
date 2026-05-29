@@ -5,6 +5,7 @@
 #include <vector>
 #include <string>
 #include <cstring>
+#include <chrono>
 
 #include "protocol.h"
 #include "chunk_source.hpp"
@@ -29,9 +30,17 @@ bool recvAll(SOCKET sock, void* buf, int len)
     return true;
 }
 
-int main()
+int main(int argc, char* argv[])
 {
-    const int PORT = 6767;
+	if(argc<2)
+	{
+		cerr<<"Usage: Client.exe <server-ip> [port]\n";
+		return 1;
+	}
+	string serverIp=argv[1];
+	int PORT=6767;
+	if(argc>=3)
+	PORT=stoi(argv[2]);
 
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
@@ -51,7 +60,7 @@ int main()
     sockaddr_in serverAddr{};
     serverAddr.sin_family = AF_INET;
     serverAddr.sin_port   = htons(PORT);
-    InetPton(AF_INET, TEXT("127.0.0.1"), &serverAddr.sin_addr);
+    InetPton(AF_INET, serverIp.c_str(), &serverAddr.sin_addr);
 
     if (connect(sock, (sockaddr*)&serverAddr, sizeof(serverAddr)) == SOCKET_ERROR)
     {
@@ -61,7 +70,11 @@ int main()
         return 1;
     }
 
-    cout << "Connected to server\n";
+    cout << "Connected to "
+     << serverIp
+     << ":"
+     << PORT
+     << "\n";
 
     // Tune socket for bulk receive
     BOOL nodelay = TRUE;
@@ -123,6 +136,9 @@ int main()
 
     uint64_t chunks_received = 0;
     uint64_t bytes_received  = 0;
+    
+    auto start_time=chrono::high_resolution_clock::now();
+    
 
     // Receive chunk loop
     while (true)
@@ -130,7 +146,12 @@ int main()
         ChunkHeader hdr{};
         if (!recvAll(sock, &hdr, sizeof(hdr)))
         {
-        	cerr<<"\nConnection lost unexpectedly\n";
+        	cerr << "\nServer disconnected during transfer.\n";
+			cerr << "Last completed chunk: "
+     		<< chunks_received
+     		<< "/"
+     		<< wire.chunk_count
+     		<< "\n";
         	outFile.close();
         	closesocket(sock);
         	WSACleanup();
@@ -157,7 +178,15 @@ int main()
         vector<char> buf(hdr.size);
         if (!recvAll(sock, buf.data(), static_cast<int>(hdr.size)))
         {
-            cerr << "\nFailed to receive chunk " << hdr.index << "\n";
+            cerr << "\nFailed while receiving chunk "
+     		<< hdr.index
+     		<< "\n";
+
+			cerr << "Progress: "
+     		<< chunks_received
+     		<< "/"
+     		<< wire.chunk_count
+     		<< " chunks received\n";
             outFile.close();
             closesocket(sock);
             WSACleanup();
@@ -174,15 +203,40 @@ int main()
         bytes_received += hdr.size;
 
         // Progress
-        double pct = wire.chunk_count > 0
-            ? (double)chunks_received / wire.chunk_count * 100.0
-            : 0.0;
-        printf("\r  chunk %llu/%llu  (%.1f%%)  %llu bytes",
-               (unsigned long long)chunks_received,
-               (unsigned long long)wire.chunk_count,
-               pct,
-               (unsigned long long)bytes_received);
-        fflush(stdout);
+        auto now = chrono::high_resolution_clock::now();
+
+		double elapsed =
+    	chrono::duration<double>(now - start_time).count();
+
+		double mb_received =
+    	bytes_received / (1024.0 * 1024.0);
+
+		double speed =
+    	elapsed > 0.0 ? mb_received / elapsed : 0.0;
+
+		double pct =
+    		wire.chunk_count > 0
+    		? (double)chunks_received / wire.chunk_count * 100.0
+    		: 0.0;
+
+		double remaining_bytes =
+    	(double)(wire.total_size - bytes_received);
+
+		double eta =
+    	speed > 0.0
+    	? (remaining_bytes / (1024.0 * 1024.0)) / speed
+    	: 0.0;
+
+printf(
+    "\rchunk %llu/%llu (%.1f%%) | %.1f MB/s | ETA %.1f s",
+    (unsigned long long)chunks_received,
+    (unsigned long long)wire.chunk_count,
+    pct,
+    speed,
+    eta
+);
+
+		fflush(stdout);
     }
 
     outFile.close();
