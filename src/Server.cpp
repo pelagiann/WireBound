@@ -2,6 +2,7 @@
 #include <WinSock2.h>
 #include <WS2tcpip.h>
 #include <windows.h>
+#include <psapi.h>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -15,6 +16,7 @@
 #include "progress_tracker.hpp"
 
 #pragma comment(lib, "Ws2_32.lib")
+#pragma comment(lib, "Psapi.lib")
 
 using namespace std;
 using namespace maxxcast;
@@ -127,12 +129,14 @@ int main(int argc, char* argv[])
 {
     if (argc < 2)
     {
-        cerr << "Usage: Server.exe <file-to-send>\n";
+        cerr << "Usage: Server.exe <file> [chunk-size-kb]\n";
         return 1;
     }
 
-    const int      PORT       = 6767;
-    const uint32_t CHUNK_SIZE = 256 * 1024;
+    const int PORT      = 6767;
+    uint32_t  CHUNK_SIZE = 256 * 1024;
+    if (argc >= 3)
+        CHUNK_SIZE = static_cast<uint32_t>(stoul(argv[2])) * 1024;
 
     MappedChunkSource src(argv[1], CHUNK_SIZE);
     const FileMeta& meta = src.metadata();
@@ -192,7 +196,12 @@ int main(int argc, char* argv[])
     g_serverSocket = serverSocket;
 
     cout << "Listening on port " << PORT << " (all interfaces)...\n";
-	vector<thread> workers;
+
+    vector<thread>    workers;
+    atomic<uint64_t>  total_bytes_sent { 0 };
+    atomic<int>       total_clients    { 0 };
+    bool              session_started  = false;
+    chrono::high_resolution_clock::time_point t_session_start;
     int client_id = 0;
 
     while (true)
@@ -206,13 +215,20 @@ int main(int argc, char* argv[])
             break;
         }
 
+        if (!session_started)
+        {
+            t_session_start = chrono::high_resolution_clock::now();
+            session_started = true;
+        }
+
         int id = ++client_id;
-        
+
         { lock_guard<mutex> lk(g_console_mtx);
           cout << "\n[Client " << id << "] connected.\n"; }
 
         // Each client gets its own thread; src is read-only so sharing is safe.
-        workers.emplace_back([clientSocket, id, &src, &meta]()
+        workers.emplace_back([clientSocket, id, &src, &meta,
+                              &total_bytes_sent, &total_clients]()
         {
             ClientProgress progress;
             progress.id           = id;
@@ -234,6 +250,9 @@ int main(int argc, char* argv[])
 
             closesocket(clientSocket);  // always runs, even if serve_client threw
 
+            total_bytes_sent += progress.bytes_sent.load();
+            total_clients++;
+
             double sec  = chrono::duration<double>(t1 - t0).count();
             double mbps = (sec > 0.0)
                           ? (meta.total_size / (1024.0 * 1024.0)) / sec
@@ -245,24 +264,40 @@ int main(int argc, char* argv[])
                    << "  " << mbps << " MB/s\n"; }
         });
     }
-	for (thread& t : workers)
-	{
-    	if (t.joinable())
-   	 	{
-        	t.join();
-    	}
-	}
+    for (thread& t : workers)
+        if (t.joinable()) t.join();
+
+    auto t_session_end = chrono::high_resolution_clock::now();
+
     IO_COUNTERS io_after{};
     GetProcessIoCounters(GetCurrentProcess(), &io_after);
-
     uint64_t disk_reads = io_after.ReadOperationCount - io_before.ReadOperationCount;
     uint64_t disk_bytes = io_after.ReadTransferCount  - io_before.ReadTransferCount;
 
-    cout << "\nDisk reads : " << disk_reads << " ops (" << disk_bytes << " bytes)\n";
+    PROCESS_MEMORY_COUNTERS pmc{};
+    pmc.cb = sizeof(pmc);
+    GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc));
+
+    double total_mb = total_bytes_sent.load() / (1024.0 * 1024.0);
+
+    cout << "\n=== Session Stats ===\n";
+    cout << "Clients       : " << total_clients.load()  << "\n";
+    cout << "Chunk size    : " << (CHUNK_SIZE / 1024)   << " KB\n";
+    cout << "Total sent    : " << total_mb              << " MB\n";
+
+    if (session_started && total_clients.load() > 0)
+    {
+        double sec  = chrono::duration<double>(t_session_end - t_session_start).count();
+        double agg  = (sec > 0.0) ? total_mb / sec : 0.0;
+        cout << "Aggregate     : " << agg << " MB/s\n";
+    }
+
+    cout << "Disk reads    : " << disk_reads << " ops (" << disk_bytes << " bytes)\n";
     if (disk_reads == 0)
-        cout << "             ^ GOOD: entire transfer served from page cache\n";
+        cout << "              ^ GOOD: served from page cache\n";
     else
-        cout << "             ^ NOTE: some disk reads occurred\n";
+        cout << "              ^ NOTE: some disk reads occurred\n";
+    cout << "Peak memory   : " << (pmc.PeakWorkingSetSize / (1024.0 * 1024.0)) << " MB\n";
 
     closesocket(serverSocket);
     WSACleanup();
