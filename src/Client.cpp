@@ -174,6 +174,16 @@ int main(int argc, char* argv[])
 
        	    return 1;
     	}
+    	if (hdr.size == 0)
+		{
+    	cerr << "\nProtocol error: received zero-size chunk at index "
+         << hdr.index << "\n";
+
+    	outFile.close();
+    	closesocket(sock);
+    	WSACleanup();
+    	return 1;
+		}
 
         vector<char> buf(hdr.size);
         if (!recvAll(sock, buf.data(), static_cast<int>(hdr.size)))
@@ -238,6 +248,36 @@ printf(
 
 		fflush(stdout);
     }
+    
+    if (chunks_received != wire.chunk_count)
+	{
+    cerr << "\nTransfer incomplete.\n";
+    cerr << "Expected chunks: "
+         << wire.chunk_count
+         << ", received: "
+         << chunks_received
+         << "\n";
+
+    outFile.close();
+    closesocket(sock);
+    WSACleanup();
+    return 1;
+	}
+
+	if (bytes_received != wire.total_size)
+	{
+    cerr << "\nFile size mismatch.\n";
+    cerr << "Expected bytes: "
+         << wire.total_size
+         << ", received: "
+         << bytes_received
+         << "\n";
+
+    outFile.close();
+    closesocket(sock);
+    WSACleanup();
+    return 1;
+	}
 
     outFile.close();
     hasher.finish();
