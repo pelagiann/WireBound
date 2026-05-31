@@ -13,7 +13,7 @@ if not exist "%FILE%" (
 )
 
 if not exist "%~dp0logs" mkdir "%~dp0logs"
-for /L %%i in (1,1,4) do (
+for /L %%i in (1,1,8) do (
     if not exist "%~dp0client%%i" mkdir "%~dp0client%%i"
 )
 
