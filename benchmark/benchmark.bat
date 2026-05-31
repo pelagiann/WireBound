@@ -1,16 +1,21 @@
 @echo off
 setlocal
 
-set SERVER=..\build\Server.exe
-set CLIENT=..\build\Client.exe
-set FILE=test.bin
+set SERVER=%~dp0..\build\Server.exe
+set CLIENT=%~dp0..\build\Client.exe
+set FILE=%~dp0test.bin
 set IP=127.0.0.1
 
-if not exist %FILE% (
-    echo ERROR: %FILE% not found. Place a test file in the benchmark\ folder.
+if not exist "%FILE%" (
+    echo ERROR: test.bin not found in benchmark\
+    echo Create it with: fsutil file createnew "%FILE%" 1073741824
     exit /b 1
 )
-if not exist logs mkdir logs
+
+if not exist "%~dp0logs" mkdir "%~dp0logs"
+for /L %%i in (1,1,4) do (
+    if not exist "%~dp0client%%i" mkdir "%~dp0client%%i"
+)
 
 echo ================================
 echo  MaxxCast Benchmark Suite
@@ -26,7 +31,7 @@ call :sweep 1024 4
 call :sweep 1024 8
 
 echo.
-echo All sweeps complete. Logs in benchmark\logs\
+echo All sweeps complete. See benchmark\logs\
 goto :eof
 
 :sweep
@@ -35,11 +40,11 @@ set N=%2
 echo.
 echo --- %CHUNK% KB chunk  x  %N% client(s) ---
 
-start "" /min cmd /c "%SERVER% %FILE% %CHUNK% > logs\srv_%CHUNK%_%N%.txt 2>&1"
-timeout /t 3 >nul
+start "" /min cmd /c "%SERVER% "%FILE%" %CHUNK% > "%~dp0logs\srv_%CHUNK%_%N%.txt" 2>&1"
+timeout /t 15 >nul
 
 for /L %%i in (1,1,%N%) do (
-    start "" /min cmd /c "%CLIENT% %IP% < nul > logs\cli_%CHUNK%_%N%_%%i.txt 2>&1"
+    start "" /D "%~dp0client%%i" /min cmd /c "%CLIENT% %IP% < nul > "%~dp0logs\cli_%CHUNK%_%N%_%%i.txt" 2>&1"
 )
 
 timeout /t 2 >nul
@@ -53,8 +58,8 @@ timeout /t 2 >nul
 
 for /L %%i in (1,1,%N%) do (
     echo   [Client %%i]:
-    type logs\cli_%CHUNK%_%N%_%%i.txt | findstr /c:"MB/s" /c:"RESULT" /c:"FAIL"
+    type "%~dp0logs\cli_%CHUNK%_%N%_%%i.txt" | findstr /c:"MB/s" /c:"RESULT" /c:"FAIL"
 )
 echo   [Server]:
-type logs\srv_%CHUNK%_%N%.txt | findstr /c:"Aggregate" /c:"Disk reads"
+type "%~dp0logs\srv_%CHUNK%_%N%.txt" | findstr /c:"Aggregate" /c:"Disk reads"
 goto :eof
