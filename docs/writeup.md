@@ -1,4 +1,4 @@
-# WireBound — High Performance LAN File Distribution System
+﻿# WireBound — High Performance LAN File Distribution System
 
 ## Overview
 
@@ -120,6 +120,29 @@ Aggregate throughput scales close to linearly up to 4 clients and then starts to
 The server-side design goal of zero disk re-reads after the first client is achieved by the memory-mapped approach. Once the OS page cache warms up on the first transfer, every subsequent client's read is served from RAM. This is confirmed by the `IO_COUNTERS` disk read delta being zero on repeated runs.
 
 The main bottleneck on the client side is picosha2, which is a pure-software SHA-256 with no hardware acceleration. At the speeds observed, hashing is likely the limiting factor rather than the network or TCP stack. On a 10GbE network this would become a visible problem.
+
+---
+
+## Real-Network Results
+
+The sweep above runs on loopback, which is a clean way to study scaling but takes the network out of the picture. To see how WireBound behaves on a real link we added an optional LZ4 compression mode and tested it between two Windows machines on the same 5 GHz Wi-Fi. The server compresses each chunk before sending and the client decompresses it, and because the client still hashes the original bytes the end-to-end SHA-256 check holds exactly as before. Compression is off by default and turned on with a flag, and any chunk that does not actually shrink is sent raw so incompressible data is never penalized. The test file was a 164 MB Windows log that compresses about 12x.
+
+The single-client numbers tell the main story:
+
+| Mode | Per-client throughput |
+|------|-----------------------|
+| Uncompressed | ~8 MB/s |
+| LZ4 | ~118 MB/s |
+
+That is roughly a 14x speedup, in line with the compression ratio. The reason is simple. On loopback the bottleneck was the server and the hashing rather than the link, so compression made no measurable difference there. On Wi-Fi the link is the bottleneck, so sending about 12x fewer bytes translates almost directly into finishing about 12x sooner.
+
+It is worth stressing that this was a 5 GHz Wi-Fi link and not an old 2.4 GHz one, yet the uncompressed rate of about 8 MB/s still reflects the real throughput between these two particular machines rather than any limit in the server. The cap comes from the wireless medium itself, things like the adapter in the weaker machine, the distance from the router and the interference around it. That is the whole takeaway. The server hands bytes to the link as fast as the link will accept them, and on Wi-Fi the link is what gives out first, which is why cutting the bytes with compression buys so much.
+
+The multi-client behavior was even more telling. With two clients connected at once and no compression the Wi-Fi link saturated and the two transfers could not share it evenly. One flow dominated while the other crawled, and only once the first finished did the second speed up, so the transfers were effectively serialized by the link. With compression on each client put only about 13 MB on the wire, the link was no longer saturated, and both clients ran in parallel at much higher rates. This is the clearest demonstration of why compression helps here, and it is also the motivation for the multicast idea in Future Work, since one TCP connection per client means the shared link carries a separate copy for everyone.
+
+Two things held up exactly as designed on real hardware. The server reported zero disk reads across every run, so the page cache served everything after the first read, and peak memory stayed flat at about 185 MB regardless of file size or client count. We also closed a few clients mid-transfer on purpose, and the server logged each dropped client and carried on serving the rest without crashing.
+
+A note on the numbers. The 12x ratio comes from a very repetitive log file. Everyday mixed data compresses more like 2x to 4x, and already-compressed files such as video, images or installers barely compress at all. The relative speedup on a network-bound link scales with whatever ratio the data allows.
 
 ---
 

@@ -1,8 +1,12 @@
 cmake_minimum_required(VERSION 3.20)
-project(MaxxCast VERSION 0.1.0 LANGUAGES CXX)
+project(MaxxCast VERSION 0.1.0 LANGUAGES CXX C)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# LZ4 lossless compression (C source, compiled as a small static lib)
+add_library(lz4 STATIC third_party/lz4.c)
+target_include_directories(lz4 PUBLIC third_party)
 
 add_executable(mmap_proof tests/mmap_proof.cpp)
 target_include_directories(mmap_proof PRIVATE include third_party)
@@ -28,11 +32,11 @@ endif()
 add_executable(Server src/Server.cpp)
 target_include_directories(Server PRIVATE include third_party)
 if(WIN32)
-    target_link_libraries(Server PRIVATE chunk_source ws2_32)
+    target_link_libraries(Server PRIVATE chunk_source lz4 ws2_32)
 endif()
 
 add_executable(Client src/Client.cpp)
 target_include_directories(Client PRIVATE include third_party)
 if(WIN32)
-    target_link_libraries(Client PRIVATE ws2_32)
+    target_link_libraries(Client PRIVATE lz4 ws2_32)
 endif()

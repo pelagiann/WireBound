@@ -10,6 +10,7 @@
 #include "protocol.h"
 #include "chunk_source.hpp"
 #include "picosha2.h"
+#include "lz4.h"
 
 #pragma comment(lib, "Ws2_32.lib")
 
@@ -118,7 +119,8 @@ int main(int argc, char* argv[])
     cout << "Size      : " << wire.total_size  << " bytes\n";
     cout << "Chunks    : " << wire.chunk_count
          << " x " << wire.chunk_size << " bytes\n";
-    cout << "Expected SHA-256: " << expected_hash << "\n\n";
+    cout << "Expected SHA-256: " << expected_hash << "\n";
+    cout << "Compression: " << (wire.compression ? "LZ4" : "none") << "\n\n";
 
     // Open output file
     ofstream outFile(filename, ios::binary);
@@ -174,7 +176,7 @@ int main(int argc, char* argv[])
 
        	    return 1;
     	}
-    	if (hdr.size == 0)
+    	if (hdr.orig_size == 0 || hdr.wire_size == 0)
 		{
     	cerr << "\nProtocol error: received zero-size chunk at index "
          << hdr.index << "\n";
@@ -185,8 +187,8 @@ int main(int argc, char* argv[])
     	return 1;
 		}
 
-        vector<char> buf(hdr.size);
-        if (!recvAll(sock, buf.data(), static_cast<int>(hdr.size)))
+        vector<char> buf(hdr.wire_size);
+        if (!recvAll(sock, buf.data(), static_cast<int>(hdr.wire_size)))
         {
             cerr << "\nFailed while receiving chunk "
      		<< hdr.index
@@ -203,14 +205,34 @@ int main(int argc, char* argv[])
             return 1;
         }
 
+        // Decompress if the server compressed this chunk.
+        vector<char> outbuf;
+        const char* data = buf.data();
+        if (hdr.compressed)
+        {
+            outbuf.resize(hdr.orig_size);
+            int d = LZ4_decompress_safe(buf.data(), outbuf.data(),
+                                        static_cast<int>(hdr.wire_size),
+                                        static_cast<int>(hdr.orig_size));
+            if (d < 0 || static_cast<uint32_t>(d) != hdr.orig_size)
+            {
+                cerr << "\nDecompression failed at chunk " << hdr.index << "\n";
+                outFile.close();
+                closesocket(sock);
+                WSACleanup();
+                return 1;
+            }
+            data = outbuf.data();
+        }
+
         // Write to disk
-        outFile.write(buf.data(), hdr.size);
+        outFile.write(data, hdr.orig_size);
 
         // Feed into the incremental hasher
-        hasher.process(buf.begin(), buf.end());
+        hasher.process(data, data + hdr.orig_size);
 
         chunks_received++;
-        bytes_received += hdr.size;
+        bytes_received += hdr.orig_size;
 
         // Progress
         auto now = chrono::high_resolution_clock::now();

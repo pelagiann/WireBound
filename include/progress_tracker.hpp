@@ -21,6 +21,7 @@ struct ClientProgress
 
     std::atomic<uint64_t> chunks_sent { 0 };
     std::atomic<uint64_t> bytes_sent  { 0 };
+    std::atomic<uint64_t> wire_bytes  { 0 };
     std::atomic<bool>     complete    { false };
     std::atomic<bool>     failed      { false };
 

@@ -14,6 +14,7 @@
 #include "chunk_source.hpp"
 #include "mapped_chunk_source.hpp"
 #include "progress_tracker.hpp"
+#include "lz4.h"
 
 #pragma comment(lib, "Ws2_32.lib")
 #pragma comment(lib, "Psapi.lib")
@@ -36,7 +37,7 @@ bool sendAll(SOCKET sock, const void* data, int len)
 }
 
 // serve_client: send the full file to one connected client.
-bool serve_client(SOCKET sock, const MappedChunkSource& src, ClientProgress& progress)
+bool serve_client(SOCKET sock, const MappedChunkSource& src, ClientProgress& progress, bool compress)
 {
     const FileMeta& meta = src.metadata();
 
@@ -49,7 +50,12 @@ bool serve_client(SOCKET sock, const MappedChunkSource& src, ClientProgress& pro
     wire.total_size  = meta.total_size;
     wire.chunk_size  = meta.chunk_size;
     wire.chunk_count = meta.chunk_count;
+    wire.compression = compress ? 1u : 0u;
     memcpy(wire.sha256_hex, meta.sha256_hex.c_str(), 64);
+
+    // Scratch buffer for LZ4 output, sized once to the worst case for a full chunk.
+    vector<char> cbuf;
+    if (compress) cbuf.resize(LZ4_compressBound(static_cast<int>(meta.chunk_size)));
 
     if (!sendAll(sock, &wire, sizeof(wire)))
     {
@@ -74,12 +80,30 @@ bool serve_client(SOCKET sock, const MappedChunkSource& src, ClientProgress& pro
         ChunkView chunk = src.get_chunk(i);
 
         ChunkHeader hdr{};
-        hdr.type = PACKET_CHUNK;
-        hdr.index = chunk.index;
-        hdr.size  = static_cast<uint32_t>(chunk.len);
+        hdr.type      = PACKET_CHUNK;
+        hdr.index     = chunk.index;
+        hdr.orig_size = static_cast<uint32_t>(chunk.len);
+
+        const char* payload     = reinterpret_cast<const char*>(chunk.data);
+        int         payload_len = static_cast<int>(chunk.len);
+
+        // Compress; only keep the result if it actually shrank the chunk.
+        if (compress)
+        {
+            int clen = LZ4_compress_default(
+                reinterpret_cast<const char*>(chunk.data), cbuf.data(),
+                static_cast<int>(chunk.len), static_cast<int>(cbuf.size()));
+            if (clen > 0 && clen < static_cast<int>(chunk.len))
+            {
+                payload        = cbuf.data();
+                payload_len    = clen;
+                hdr.compressed = 1;
+            }
+        }
+        hdr.wire_size = static_cast<uint32_t>(payload_len);
 
         if (!sendAll(sock, &hdr, sizeof(hdr)) ||
-            !sendAll(sock, chunk.data, static_cast<int>(chunk.len)))
+            !sendAll(sock, payload, payload_len))
         {
             { lock_guard<mutex> lk(g_console_mtx);
               cerr << "\n[Client " << progress.id
@@ -89,7 +113,8 @@ bool serve_client(SOCKET sock, const MappedChunkSource& src, ClientProgress& pro
         }
 
         progress.chunks_sent++;
-        progress.bytes_sent += chunk.len;
+        progress.bytes_sent += chunk.len;       // original bytes (logical throughput)
+        progress.wire_bytes += payload_len;     // actual bytes on the wire
         progress.print_inline();
     }
     
@@ -129,7 +154,7 @@ int main(int argc, char* argv[])
 {
     if (argc < 2)
     {
-        cerr << "Usage: Server.exe <file> [chunk-size-kb]\n";
+        cerr << "Usage: Server.exe <file> [chunk-size-kb] [compress 0|1]\n";
         return 1;
     }
 
@@ -142,6 +167,13 @@ int main(int argc, char* argv[])
         if (CHUNK_SIZE == 0) { cerr << "chunk-size-kb must be > 0\n"; return 1; }
     }
 
+    bool COMPRESS = false;
+    if (argc >= 4)
+    {
+        string c = argv[3];
+        COMPRESS = (c == "1" || c == "on" || c == "true");
+    }
+
     MappedChunkSource src(argv[1], CHUNK_SIZE);
     const FileMeta& meta = src.metadata();
 
@@ -150,7 +182,8 @@ int main(int argc, char* argv[])
     cout << "Size      : " << meta.total_size << " bytes\n";
     cout << "Chunks    : " << meta.chunk_count
          << " x " << meta.chunk_size << " bytes\n";
-    cout << "SHA-256   : " << meta.sha256_hex << "\n\n";
+    cout << "SHA-256   : " << meta.sha256_hex << "\n";
+    cout << "Compress  : " << (COMPRESS ? "LZ4" : "off") << "\n\n";
 
     IO_COUNTERS io_before{};
     GetProcessIoCounters(GetCurrentProcess(), &io_before);
@@ -203,6 +236,7 @@ int main(int argc, char* argv[])
 
     vector<thread>    workers;
     atomic<uint64_t>  total_bytes_sent { 0 };
+    atomic<uint64_t>  total_wire_sent  { 0 };
     atomic<int>       total_clients    { 0 };
     bool              session_started  = false;
     chrono::high_resolution_clock::time_point t_session_start;
@@ -232,7 +266,7 @@ int main(int argc, char* argv[])
 
         // Each client gets its own thread; src is read-only so sharing is safe.
         workers.emplace_back([clientSocket, id, &src, &meta,
-                              &total_bytes_sent, &total_clients]()
+                              &total_bytes_sent, &total_wire_sent, &total_clients, COMPRESS]()
         {
             ClientProgress progress;
             progress.id           = id;
@@ -243,7 +277,7 @@ int main(int argc, char* argv[])
             bool ok = false;
             try
             {
-                ok = serve_client(clientSocket, src, progress);
+                ok = serve_client(clientSocket, src, progress, COMPRESS);
             }
             catch (...)
             {
@@ -255,6 +289,7 @@ int main(int argc, char* argv[])
             closesocket(clientSocket);  // always runs, even if serve_client threw
 
             total_bytes_sent += progress.bytes_sent.load();
+            total_wire_sent  += progress.wire_bytes.load();
             total_clients++;
 
             double sec  = chrono::duration<double>(t1 - t0).count();
@@ -288,6 +323,13 @@ int main(int argc, char* argv[])
     cout << "Clients       : " << total_clients.load()  << "\n";
     cout << "Chunk size    : " << (CHUNK_SIZE / 1024)   << " KB\n";
     cout << "Total sent    : " << total_mb              << " MB\n";
+
+    if (total_wire_sent.load() > 0 && total_wire_sent.load() != total_bytes_sent.load())
+    {
+        double wire_mb = total_wire_sent.load() / (1024.0 * 1024.0);
+        double ratio   = (double)total_bytes_sent.load() / (double)total_wire_sent.load();
+        cout << "On the wire   : " << wire_mb << " MB  (LZ4 ratio " << ratio << "x)\n";
+    }
 
     if (session_started && total_clients.load() > 0)
     {

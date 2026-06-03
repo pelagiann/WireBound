@@ -1,4 +1,4 @@
-# WireBound
+﻿# WireBound
 
 High-performance LAN file distribution over TCP. A server memory-maps a file and streams it in chunks to any number of simultaneous clients. Each client verifies the received file with SHA-256.
 
@@ -21,9 +21,9 @@ Produces `build/Server.exe` and `build/Client.exe`.
 
 **Server**
 ```
-build\Server.exe <file> [chunk-size-kb]
+build\Server.exe <file> [chunk-size-kb] [compress 0|1]
 ```
-Defaults to 256 KB chunks. Listens on port 6767. Press Ctrl+C to shut down — active transfers finish before the process exits.
+Defaults to 256 KB chunks, compression off. Pass `1` as the third argument to enable LZ4 compression. Listens on port 6767. Press Ctrl+C to shut down, active transfers finish before the process exits.
 
 **Client**
 ```
@@ -58,6 +58,17 @@ python benchmark\make_graphs.py
 
 Single-client throughput (~112 MB/s) sits at the Gigabit Ethernet ceiling. The loopback sweep is a scaling study — the per-client bottleneck is SHA-256 hashing (picosha2, software-only), not the network path.
 
+### Real-network results
+
+The table above is loopback, which deliberately takes the network out of the picture. Tested between two Windows machines on the same 5 GHz Wi-Fi with a 164 MB log file that compresses about 12x, with LZ4 compression off and then on:
+
+| Mode | Per-client throughput |
+|------|-----------------------|
+| Uncompressed | ~8 MB/s |
+| LZ4 | ~118 MB/s |
+
+That is roughly a 14x speedup. On loopback the link is not the bottleneck so compression does nothing, but on Wi-Fi the link is the bottleneck so sending about 12x fewer bytes finishes about 12x sooner. With two clients connected at once and no compression the link saturates and the transfers serialize, one flow dominating while the other crawls until the first finishes. With compression on the link has room to spare so both clients run in parallel. Already-compressed files such as video or installers do not shrink, in which case the server sends them uncompressed with no penalty, so compression stays an optional flag rather than always-on.
+
 ## Project layout
 
 ```
@@ -84,4 +95,3 @@ third_party/
 ## Documentation
 
 A detailed writeup covering the architecture, protocol design, implementation and benchmark analysis is in [`docs/writeup.md`](docs/writeup.md). A formatted Word version is also available at [`docs/WireBound_Writeup.docx`](docs/WireBound_Writeup.docx).
-
